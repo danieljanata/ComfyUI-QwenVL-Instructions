@@ -1,41 +1,34 @@
-import importlib.util
-import os
-import sys
+import os, sys, importlib.util
 
-# Get the directory of the current script
 current_dir = os.path.dirname(__file__)
 sys.path.insert(0, current_dir)
 
+# Only expose the "Instructions" node(s) from this addon.
+# Upstream modules are still importable for shared code (QwenVLBase, etc.),
+# but their nodes are intentionally not registered here.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 WEB_DIRECTORY = "./web"
 
-def load_modules_from_directory(directory):
-    for file in os.listdir(directory):
-        if file.endswith(".py"):
-            file_path = os.path.join(directory, file)
-            module_name = os.path.basename(file)[:-3]
-            if module_name == os.path.basename(__file__)[:-3]:
-                continue
+def _load_module(py_filename: str):
+    file_path = os.path.join(current_dir, py_filename)
+    module_name = os.path.splitext(py_filename)[0]
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot create spec for {py_filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
-            try:
-                spec = importlib.util.spec_from_file_location(module_name, file_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
+# Ensure base code is importable (does not register nodes)
+_load_module("AILab_QwenVL.py")
 
-                if hasattr(module, "NODE_CLASS_MAPPINGS"):
-                    NODE_CLASS_MAPPINGS.update(module.NODE_CLASS_MAPPINGS)
-                if hasattr(module, "NODE_DISPLAY_NAME_MAPPINGS"):
-                    NODE_DISPLAY_NAME_MAPPINGS.update(module.NODE_DISPLAY_NAME_MAPPINGS)
-            except Exception as e:
-                print(f"Error loading module {module_name}: {e}")
+# Register only our node(s)
+m = _load_module("AILab_QwenVL_Instructions.py")
+if hasattr(m, "NODE_CLASS_MAPPINGS"):
+    NODE_CLASS_MAPPINGS.update(m.NODE_CLASS_MAPPINGS)
+if hasattr(m, "NODE_DISPLAY_NAME_MAPPINGS"):
+    NODE_DISPLAY_NAME_MAPPINGS.update(m.NODE_DISPLAY_NAME_MAPPINGS)
 
-load_modules_from_directory(current_dir)
-NODE_CLASS_MAPPINGS = dict(sorted(NODE_CLASS_MAPPINGS.items(), key=lambda x: NODE_DISPLAY_NAME_MAPPINGS.get(x[0], x[0])))
-NODE_DISPLAY_NAME_MAPPINGS = dict(sorted(NODE_DISPLAY_NAME_MAPPINGS.items(), key=lambda x: x[1]))
-
-__all__ = [
-    "NODE_CLASS_MAPPINGS",
-    "NODE_DISPLAY_NAME_MAPPINGS"
-]
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

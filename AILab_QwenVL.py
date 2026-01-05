@@ -28,6 +28,14 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer, B
 
 import folder_paths
 
+# ComfyUI memory management - try to import for proper VRAM cleanup
+try:
+    import comfy.model_management as comfy_mm
+    HAS_COMFY_MM = True
+except ImportError:
+    HAS_COMFY_MM = False
+    print("[QwenVL] Warning: comfy.model_management not available, memory cleanup may be limited")
+
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
 SYSTEM_PROMPTS_PATH = NODE_DIR / "AILab_System_Prompts.json"
@@ -314,23 +322,96 @@ def quantization_config(model_name, quantization):
         return BitsAndBytesConfig(load_in_8bit=True), None
     return None, torch.float16 if torch.cuda.is_available() else torch.float32
 
+# =============================================================================
+# GLOBAL MODEL CACHE - shared between all QwenVL node instances
+# =============================================================================
+_GLOBAL_MODEL_CACHE = {
+    "model": None,
+    "processor": None,
+    "tokenizer": None,
+    "signature": None,
+}
+
+
+def clear_global_cache():
+    """Clear the global model cache and free VRAM/RAM."""
+    global _GLOBAL_MODEL_CACHE
+    
+    if _GLOBAL_MODEL_CACHE["model"] is not None:
+        print("[QwenVL] Clearing global model cache...")
+    
+    _GLOBAL_MODEL_CACHE["model"] = None
+    _GLOBAL_MODEL_CACHE["processor"] = None
+    _GLOBAL_MODEL_CACHE["tokenizer"] = None
+    _GLOBAL_MODEL_CACHE["signature"] = None
+    
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    print("[QwenVL] Global cache cleared, VRAM freed.")
+
+
 class QwenVLBase:
+    """
+    Base class for QwenVL nodes.
+    
+    Uses a GLOBAL MODEL CACHE so multiple nodes can share the same loaded model.
+    This allows chaining nodes (e.g., MultiSlot → TextEnhancer) without loading
+    the model twice.
+    
+    Set keep_model_loaded=TRUE on all nodes except the LAST one in your chain.
+    The last node should have keep_model_loaded=FALSE to free VRAM after completion.
+    """
+    
     def __init__(self):
         self.device_info = get_device_info()
-        self.model = None
-        self.processor = None
-        self.tokenizer = None
-        self.current_signature = None
-        print(f"[QwenVL] Node on {self.device_info['device_type']}")
+        print(f"[QwenVL] Node initialized on {self.device_info['device_type']}")
+
+    @property
+    def model(self):
+        """Access model from global cache."""
+        return _GLOBAL_MODEL_CACHE["model"]
+    
+    @model.setter
+    def model(self, value):
+        """Store model in global cache."""
+        _GLOBAL_MODEL_CACHE["model"] = value
+    
+    @property
+    def processor(self):
+        """Access processor from global cache."""
+        return _GLOBAL_MODEL_CACHE["processor"]
+    
+    @processor.setter
+    def processor(self, value):
+        """Store processor in global cache."""
+        _GLOBAL_MODEL_CACHE["processor"] = value
+    
+    @property
+    def tokenizer(self):
+        """Access tokenizer from global cache."""
+        return _GLOBAL_MODEL_CACHE["tokenizer"]
+    
+    @tokenizer.setter
+    def tokenizer(self, value):
+        """Store tokenizer in global cache."""
+        _GLOBAL_MODEL_CACHE["tokenizer"] = value
+    
+    @property
+    def current_signature(self):
+        """Access signature from global cache."""
+        return _GLOBAL_MODEL_CACHE["signature"]
+    
+    @current_signature.setter
+    def current_signature(self, value):
+        """Store signature in global cache."""
+        _GLOBAL_MODEL_CACHE["signature"] = value
 
     def clear(self):
-        self.model = None
-        self.processor = None
-        self.tokenizer = None
-        self.current_signature = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        """Clear the global model cache."""
+        clear_global_cache()
 
     def load_model(
         self,
@@ -341,14 +422,25 @@ class QwenVLBase:
         device_choice,
         keep_model_loaded,
     ):
+        # Refresh device info to see current VRAM state
+        self.device_info = get_device_info()
+        
         quant = enforce_memory(model_name, Quantization.from_value(quant_value), self.device_info)
         attn_impl = resolve_attention_mode(attention_mode)
         device_requested = self.device_info["recommended_device"] if device_choice == "auto" else device_choice
         device = normalize_device_choice(device_requested)
         signature = (model_name, quant.value, attn_impl, device, use_compile)
-        if keep_model_loaded and self.model is not None and self.current_signature == signature:
+        
+        # Check if model is already loaded with same settings (in global cache)
+        if self.model is not None and self.current_signature == signature:
+            print(f"[QwenVL] Reusing cached model: {model_name}")
             return
-        self.clear()
+        
+        # Different model requested or no model loaded - clear and load new
+        if self.model is not None:
+            print(f"[QwenVL] Different model requested, clearing cache...")
+            self.clear()
+        
         model_path = ensure_model(model_name)
         quant_config, dtype = quantization_config(model_name, quant)
         load_kwargs = {
